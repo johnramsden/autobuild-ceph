@@ -59,17 +59,19 @@ class ExecutionHandlers:
         }
 
     def check_patch(self, path: str) -> dict[str, Any]:
-        """Dry-run a quilt patch using the same flags dpkg-source uses."""
+        """Dry-run a patch using the same flags dpkg-source uses.
+
+        Tests whether the patch applies cleanly to the source tree *in its
+        current state* (all previously-applied patches still in place).
+        This matches how dpkg-source applies patches in series order: each
+        patch is applied on top of the previous ones, so our new patch
+        (appended last in series) must apply to the fully-patched tree.
+        """
         guards.assert_in_scope(path)
         rel = guards.normalize(path)
         full = f"{self.runner._cfg.container_workdir}/{rel}"  # type: ignore[attr-defined]
         workdir = self.runner._cfg.container_workdir  # type: ignore[attr-defined]
-        # Reset quilt state first so the dry-run sees a clean tree, then
-        # apply with -F 0 (zero fuzz) and -p1 — exactly what dpkg-source uses.
-        cmd = (
-            f"quilt pop -a 2>/dev/null; "
-            f"patch -F 0 -p1 --dry-run < {shlex.quote(full)}"
-        )
+        cmd = f"patch -F 0 -p1 --dry-run < {shlex.quote(full)}"
         result = self.runner._lxd.exec(  # type: ignore[attr-defined]
             self.container,
             ["bash", "-c", cmd],

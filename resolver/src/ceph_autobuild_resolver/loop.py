@@ -193,7 +193,25 @@ def run_loop(
             )
             continue
 
-        outcome = dispatcher.dispatch(reply.tool_calls)
+        try:
+            outcome = dispatcher.dispatch(reply.tool_calls)
+        except BaseException as exc:
+            # Catch anything that escaped the dispatcher's own broad handler
+            # (e.g. BrokenPipeError from display, or a transient LXD fault).
+            # Surface it as a structured tool error so the loop can continue
+            # rather than silently dying without writing to the transcript.
+            log.exception("dispatcher raised unexpectedly: %s", exc)
+            from .providers.base import ToolResult
+            from .tools.dispatch import DispatchOutcome
+            synthetic_results = [
+                ToolResult(
+                    call_id=tc.id,
+                    name=tc.name,
+                    payload={"error": "dispatcher_crash", "message": str(exc)},
+                )
+                for tc in reply.tool_calls
+            ]
+            outcome = DispatchOutcome(results=synthetic_results)
         transcript.tool_results(outcome.results)
         history.append(Message(role="tool", tool_results=outcome.results))
 
