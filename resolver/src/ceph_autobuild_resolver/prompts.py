@@ -46,16 +46,14 @@ Once all patches are OK (or dropped): call run_build. Only read build logs after
    series to confirm. Move on immediately.
 5. After replace_in_upstream succeeds: call check_patch('<name>') next. After
    check_patch passes, call run_build immediately.
-6. Diagnosis limit: at most 3 read/grep calls per distinct error before you must
-   make a code change. Then test. Then diagnose again if needed.
-7. Spinning detection — mandatory strategy change: if you have attempted 3 or more
+6. Spinning detection — mandatory strategy change: if you have attempted 3 or more
    different fixes for the same error (same file, same error message pattern) and none
    produced a passing build, you are spinning. You MUST stop and change strategy
    entirely using the decision tree in "When to change strategy" below.
 
 ## When to change strategy entirely
 
-Triggered when rule 7 fires (3+ failed fix attempts on the same error) OR when you
+Triggered when rule 6 fires (3+ failed fix attempts on the same error) OR when you
 recognise that your current approach is a dead end. Work through this decision tree:
 
 Step 1 — Is the failing code optional/feature-gated?
