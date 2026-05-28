@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-import re
-import shlex
 import time
 from dataclasses import dataclass
 
-from . import display, prompts, validation
+from . import display, preflight as pf, prompts, validation
 from .budget import Budget
-from .build_runner import BuildRunner
+from .build_runner import BuildRunner, first_error_line
+from .build_steps import CONTAINER_CCACHE_DIR
 from .config import Config
 from .loop import run_loop
 from .lxd import LXDError, LXDManager
@@ -71,8 +70,8 @@ def run(
     if cfg.ccache_host_dir:
         from .prep import _prepare_ccache_dir
         if _prepare_ccache_dir(cfg.ccache_host_dir):
-            log.info("ensuring ccache device %s -> /root/ccache", cfg.ccache_host_dir)
-            lxd.attach_disk_device(container, "ccache", cfg.ccache_host_dir, "/root/ccache")
+            log.info("ensuring ccache device %s -> %s", cfg.ccache_host_dir, CONTAINER_CCACHE_DIR)
+            lxd.attach_disk_device(container, "ccache", cfg.ccache_host_dir, CONTAINER_CCACHE_DIR)
 
     # 1. First build attempt against the pristine state. If it works, we're
     #    done before touching the model.
@@ -88,18 +87,21 @@ def run(
     #    no need to involve the model. Many CI failures are just "patch X
     #    got merged upstream in this release" and resolve here.
     patch_series = _capture_patch_series(lxd, container, cfg)
-    preflight = _safe_preflight(lxd, container, cfg, patch_series)
-    _record_preflight(transcript, preflight)
+    pf_result = pf.run(lxd, container, cfg, patch_series)
+    pf.record(transcript, pf_result)
     current_failure = initial
-    if preflight.dropped or preflight.refreshed:
+    if pf_result.dropped or pf_result.refreshed:
         log.info(
             "preflight summary: dropped=%d refreshed=%d — retrying build",
-            len(preflight.dropped), len(preflight.refreshed),
+            len(pf_result.dropped), len(pf_result.refreshed),
         )
         current_failure = runner.build(container)
         transcript.build_attempt(current_failure)
         if current_failure.ok:
             log.info("preflight auto-fix succeeded; skipping model loop")
+            # No emit_summary here: we don't have a budget object yet since
+            # we never entered the loop. The run summary is skipped for the
+            # preflight-success fast path; the PR payload carries the story.
             return _validate_and_publish(
                 lxd=lxd,
                 runner=runner,
@@ -110,12 +112,12 @@ def run(
                 transcript=transcript,
                 dry_run_output=dry_run_output,
                 initial=initial,
-                summary=_format_preflight_summary(preflight),
+                summary=pf.format_summary(pf_result),
             )
         # Build still failing — refresh series + report for the model.
         patch_series = _capture_patch_series(lxd, container, cfg)
-        preflight = _safe_preflight(lxd, container, cfg, patch_series)
-        _record_preflight(transcript, preflight)
+        pf_result = pf.run(lxd, container, cfg, patch_series)
+        pf.record(transcript, pf_result)
 
     # 3. Set up the resolution loop with the (possibly cleaned) state.
     provider = build_provider(cfg)
@@ -137,7 +139,7 @@ def run(
     history = [
         prompts.system_message(),
         prompts.initial_user_message(
-            cfg, file_tree, current_failure, patch_series, preflight.report
+            cfg, file_tree, current_failure, patch_series, pf_result.report
         ),
     ]
     transcript.initial_context(
@@ -165,7 +167,7 @@ def run(
             iterations=budget.iterations_used,
             total_tokens=budget.total_tokens_used,
             elapsed_seconds=time.monotonic() - _start,
-            initial_error=_first_error_line(current_failure.log_tail),
+            initial_error=first_error_line(current_failure.log_tail),
             resolution_summary=resolution_summary or "",
             diff=diff,
             last_build_error=last_error,
@@ -173,16 +175,25 @@ def run(
 
     if not loop_result.declared_resolved:
         transcript.outcome("loop_failed", stop_reason=loop_result.stop_reason)
+        last_error = _last_build_error(loop_result.history)
         _emit_summary(
             success=False,
             stop_reason=loop_result.stop_reason,
-            last_error=_last_build_error(loop_result.history),
+            last_error=last_error,
+        )
+        # For declare_unresolvable, the model's explanation is more useful
+        # than the raw build log tail. Use it as the error_tail so it appears
+        # in the CI failure output and the eventual Launchpad bug description.
+        error_tail = (
+            loop_result.resolution_summary or initial.log_tail
+            if loop_result.stop_reason == "declared_unresolvable"
+            else initial.log_tail
         )
         file_bug(
             BugPayload(
                 matrix_name=matrix_name,
                 failing_command=initial.stage,
-                error_tail=initial.log_tail,
+                error_tail=error_tail,
                 transcript_path=str(transcript.path),
                 stop_reason=loop_result.stop_reason,
             ),
@@ -191,7 +202,7 @@ def run(
         return Outcome(1, f"resolution failed: {loop_result.stop_reason}")
 
     summary = loop_result.resolution_summary or "(no summary provided)"
-    preflight_note = _format_preflight_summary(preflight)
+    preflight_note = pf.format_summary(pf_result)
     if preflight_note:
         summary = summary + "\n\n" + preflight_note
     return _validate_and_publish(
@@ -245,7 +256,7 @@ def _validate_and_publish(
                 success=False,
                 stop_reason="validation_failed",
                 diff=diff,
-                last_error=_first_error_line(
+                last_error=first_error_line(
                     val.build_outcome.log_tail or val.apply_stderr
                 ),
             )
@@ -269,10 +280,7 @@ def _validate_and_publish(
             matrix_name=matrix_name,
             summary=summary,
             diff=diff,
-            failing_command=initial.stage,
-            original_error_tail=initial.log_tail,
             transcript_path=str(transcript.path),
-            flags={},
         ),
         dry_run=dry_run_output,
     )
@@ -308,293 +316,6 @@ def _capture_patch_series(lxd: LXDManager, container: str, cfg: Config) -> str:
     return result.stdout if result.ok else ""
 
 
-@dataclass
-class PreflightResult:
-    """Outcome of the deterministic patch preflight pass.
-
-    ``report`` is a human-readable summary (passed into the model context if
-    we end up invoking the loop).
-    ``dropped`` lists patches removed from series + filesystem because their
-    changes are already in the upstream source.
-    ``refreshed`` lists patches whose hunk locations had drifted but were
-    re-derived against the current upstream via quilt push -f + quilt refresh.
-    """
-
-    report: str
-    dropped: list[str]
-    refreshed: list[str]
-
-
-def _run_patch_preflight(
-    lxd: LXDManager, container: str, cfg: Config, series: str
-) -> PreflightResult:
-    """Two-phase deterministic audit of debian/patches/series.
-
-    Phase 1 — drop reversed patches:
-      For each series entry, run ``patch -F 0 -p1 --dry-run``. If the patch
-      reports "Reversed (or previously applied)", the upstream already
-      contains those changes; remove the entry and file.
-
-    Phase 2 — auto-refresh drifted patches:
-      Walk surviving patches with quilt. For each one, try ``quilt push
-      --fuzz=0`` (matches dpkg-source's strictness). If it fails but
-      ``quilt push -f --fuzz=2`` succeeds, the patch is correct in intent
-      but the surrounding upstream context has shifted — ``quilt refresh``
-      regenerates the .patch with current line numbers and context.
-
-    Anything that survives both phases (and didn't break the series walk)
-    is either OK or a genuine semantic conflict the model needs to address.
-    """
-    patches = [
-        line.strip()
-        for line in series.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    if not patches:
-        return PreflightResult(report="", dropped=[], refreshed=[])
-
-    workdir = cfg.container_workdir
-
-    # ---- Phase 1: drop reversed patches ---------------------------------
-    log.info("preflight phase 1: scanning %d patches for reversed state", len(patches))
-    _reset_tree(lxd, container, workdir)
-    dropped: list[str] = []
-    for patch in patches:
-        full = f"{workdir}/debian/patches/{patch}"
-        result = lxd.exec(
-            container,
-            ["bash", "-c", f"patch -F 0 -p1 --dry-run < {shlex.quote(full)}"],
-            cwd=workdir,
-            check=False,
-        )
-        combined = (result.stdout + result.stderr).strip()
-        if not result.ok and (
-            "Reversed" in combined or "previously applied" in combined
-        ):
-            log.info("preflight: %s — REVERSED, dropping from series", patch)
-            _drop_patch_in_container(lxd, container, cfg, patch)
-            dropped.append(patch)
-
-    # ---- Phase 2: walk surviving series with quilt; refresh drift -------
-    surviving = [p for p in patches if p not in dropped]
-    statuses: dict[str, str] = {}
-    refreshed: list[str] = []
-
-    if not _ensure_quilt(lxd, container):
-        log.warning(
-            "preflight phase 2: quilt unavailable in container; skipping "
-            "auto-refresh. Patches with hunk drift will be left for the model."
-        )
-        # Build the report from phase 1 only and return.
-        rows: list[str] = []
-        for p in patches:
-            if p in dropped:
-                rows.append(f"  {p}: REVERSED — auto-dropped from series")
-            else:
-                rows.append(f"  {p}: (phase 2 skipped — quilt unavailable)")
-        return PreflightResult(
-            report="\n".join(rows), dropped=dropped, refreshed=[]
-        )
-
-    log.info(
-        "preflight phase 2: walking %d surviving patches; auto-refreshing drift",
-        len(surviving),
-    )
-    _reset_tree(lxd, container, workdir)
-
-    for patch in surviving:
-        # Strict push first (zero fuzz = same as dpkg-source's patch -F 0).
-        strict = lxd.exec(
-            container,
-            ["bash", "-c", "quilt push --fuzz=0"],
-            cwd=workdir,
-            check=False,
-        )
-        if strict.ok:
-            statuses[patch] = "OK"
-            log.debug("preflight: %s — OK", patch)
-            continue
-        # Strict push failed. Try forcing with limited fuzz.
-        forced = lxd.exec(
-            container,
-            ["bash", "-c", "quilt push -f --fuzz=2"],
-            cwd=workdir,
-            check=False,
-        )
-        if forced.ok:
-            refresh = lxd.exec(
-                container,
-                ["bash", "-c", "quilt refresh"],
-                cwd=workdir,
-                check=False,
-            )
-            if refresh.ok:
-                log.info(
-                    "preflight: %s — drift detected, AUTO-REFRESHED via "
-                    "quilt push -f + quilt refresh",
-                    patch,
-                )
-                refreshed.append(patch)
-                statuses[patch] = "AUTO-REFRESHED — line numbers updated"
-                continue
-            log.warning("preflight: %s — quilt refresh failed", patch)
-            statuses[patch] = "FAIL: quilt refresh failed"
-            break
-        # Genuine conflict: even with fuzz the patch can't apply.
-        err = _first_failure_line(forced.stdout + forced.stderr)
-        log.warning("preflight: %s — FAIL: %s", patch, err)
-        statuses[patch] = f"FAIL: {err}"
-        break  # series walk halts; later patches can't be evaluated
-
-    _reset_tree(lxd, container, workdir)
-
-    # ---- Build report in original series order --------------------------
-    rows: list[str] = []
-    for p in patches:
-        if p in dropped:
-            rows.append(f"  {p}: REVERSED — auto-dropped from series")
-        elif p in statuses:
-            rows.append(f"  {p}: {statuses[p]}")
-        else:
-            rows.append(f"  {p}: not reached (earlier patch failed)")
-
-    return PreflightResult(
-        report="\n".join(rows),
-        dropped=dropped,
-        refreshed=refreshed,
-    )
-
-
-def _record_preflight(transcript: Transcript, preflight: PreflightResult) -> None:
-    """Persist preflight outcome to the transcript and render to the terminal."""
-    transcript.preflight(
-        dropped=preflight.dropped,
-        refreshed=preflight.refreshed,
-        report=preflight.report,
-    )
-    display.preflight_summary(
-        preflight.report, preflight.dropped, preflight.refreshed
-    )
-
-
-def _format_preflight_summary(preflight: PreflightResult) -> str:
-    """Human-readable description of what the preflight changed."""
-    parts: list[str] = []
-    if preflight.dropped:
-        parts.append(
-            f"Removed {len(preflight.dropped)} patch(es) already merged into "
-            f"the upstream source: " + ", ".join(preflight.dropped)
-        )
-    if preflight.refreshed:
-        parts.append(
-            f"Auto-refreshed {len(preflight.refreshed)} patch(es) whose "
-            f"hunk locations had drifted (line numbers/context regenerated "
-            f"via quilt refresh; semantic intent unchanged): "
-            + ", ".join(preflight.refreshed)
-        )
-    return "\n\n".join(parts)
-
-
-def _safe_preflight(
-    lxd: LXDManager, container: str, cfg: Config, series: str
-) -> PreflightResult:
-    """Run the preflight; on any failure return an empty result.
-
-    The preflight is a best-effort optimisation. If it crashes (LXD command
-    not found, transient API error, malformed series file, etc.) we don't
-    want to take down the whole resolver — the model can still do the work.
-    """
-    try:
-        return _run_patch_preflight(lxd, container, cfg, series)
-    except LXDError as exc:
-        log.warning(
-            "preflight aborted due to LXD error: %s — proceeding without it",
-            exc,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "preflight aborted due to unexpected error: %s — proceeding without it",
-            exc,
-        )
-    return PreflightResult(report="", dropped=[], refreshed=[])
-
-
-def _ensure_quilt(lxd: LXDManager, container: str) -> bool:
-    """Make quilt available in the container; return False if we can't."""
-    have = lxd.exec(
-        container, ["bash", "-c", "command -v quilt"], check=False
-    )
-    if have.ok:
-        return True
-    log.info("preflight: quilt not present in container, installing")
-    install = lxd.exec(
-        container,
-        ["bash", "-c", "sudo apt-get install -y quilt"],
-        check=False,
-    )
-    if not install.ok:
-        log.warning(
-            "preflight: failed to install quilt: %s",
-            (install.stderr or install.stdout).strip()[:200],
-        )
-        return False
-    verify = lxd.exec(
-        container, ["bash", "-c", "command -v quilt"], check=False
-    )
-    return verify.ok
-
-
-def _reset_tree(lxd: LXDManager, container: str, workdir: str) -> None:
-    """Pop quilt state and reset upstream files to their committed form.
-
-    Mirrors the reset performed at the start of build_stage so the preflight
-    sees the same clean tree dpkg-source would.
-    """
-    lxd.exec(
-        container,
-        [
-            "bash",
-            "-c",
-            "quilt pop -a 2>/dev/null || true; "
-            "rm -rf .pc; "
-            "git checkout HEAD -- . ':(exclude)debian' 2>/dev/null || true; "
-            "git clean -fd -e debian/ 2>/dev/null || true; "
-            "true",
-        ],
-        cwd=workdir,
-        check=False,
-    )
-
-
-def _first_failure_line(output: str) -> str:
-    for line in output.splitlines():
-        low = line.lower()
-        if "failed" in low or "malformed" in low or "error" in low:
-            return line.strip()
-    return output.strip()[:120]
-
-
-def _drop_patch_in_container(
-    lxd: LXDManager, container: str, cfg: Config, patch_name: str
-) -> None:
-    """Remove ``patch_name`` from series and delete the patch file."""
-    workdir = cfg.container_workdir
-    series_path = f"{workdir}/debian/patches/series"
-    cur = lxd.exec(container, ["cat", series_path], check=False)
-    if cur.ok:
-        kept = [
-            line for line in cur.stdout.splitlines() if line.strip() != patch_name
-        ]
-        new_series = "\n".join(kept)
-        if new_series and not new_series.endswith("\n"):
-            new_series += "\n"
-        lxd.put_text(container, series_path, new_series)
-    lxd.exec(
-        container,
-        ["rm", "-f", f"{workdir}/debian/patches/{patch_name}"],
-        check=False,
-    )
-
 
 def _capture_diff(lxd: LXDManager, container: str, cfg: Config) -> str:
     """Capture the model's accumulated changes as a unified diff against HEAD.
@@ -626,23 +347,8 @@ def _capture_diff(lxd: LXDManager, container: str, cfg: Config) -> str:
     return result.stdout
 
 
-_ERROR_RE = re.compile(r"\b(error|failed|fatal)\b", re.IGNORECASE)
-_ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
-
-
-def _first_error_line(log_tail: str) -> str:
-    """Return the first recognisable error line from a build log tail."""
-    for line in log_tail.splitlines():
-        if _ENV_VAR_RE.match(line):
-            continue
-        if _ERROR_RE.search(line):
-            return line.strip()[:200]
-    return log_tail.strip().splitlines()[-1][:200] if log_tail.strip() else ""
-
-
 def _last_build_error(history) -> str:
-    """Scan loop history for the last failed run_build error line."""
-    from .providers.base import Message
+    """Scan loop history for the first error line from the last failed run_build."""
     last = ""
     for msg in history:
         if msg.role != "tool":
@@ -650,7 +356,7 @@ def _last_build_error(history) -> str:
         for r in msg.tool_results:
             if r.name == "run_build" and not r.payload.get("ok"):
                 tail = r.payload.get("log_tail") or ""
-                line = _first_error_line(tail)
+                line = first_error_line(tail)
                 if line:
                     last = line
     return last

@@ -7,9 +7,7 @@ compact — every token here is paid for on every subsequent turn.
 
 from __future__ import annotations
 
-import re
-
-from .build_runner import BuildOutcome
+from .build_runner import BuildOutcome, first_error_line
 from .config import Config
 from .providers.base import Message
 
@@ -102,6 +100,12 @@ Step 3 — If no path forward exists:
                       For a patch touching N files: drop_patch first, then call
                       replace_in_upstream N times (one per file) before calling check_patch.
                       Do NOT call check_patch after each file — only after all files are done.
+                      CRITICAL — keep old_content SHORT (a few lines). Reproducing large
+                      blocks verbatim is unreliable; use a unique anchor instead.
+                      Example: to add a namespace wrapper around a file body, make TWO
+                      calls — one replacing the first distinctive line (e.g. the first
+                      #define or forward declaration) with that line + "namespace X {",
+                      and one replacing "#endif" at EOF with "} // namespace X\n\n#endif".
 - check_patch         Dry-runs `patch -F 0 -p1` (identical flags to dpkg-source). A passing
                       result guarantees the patch applies cleanly in the real build.
 - edit_file/write_file Target must be inside debian/. Direct edits to upstream source files
@@ -140,19 +144,8 @@ Step 3 — If no path forward exists:
   source patches. Source-level fixes for API-changed third-party interfaces can be
   indefinitely difficult; disabling the optional feature is often the correct Debian
   packaging decision.
+
 """
-
-
-def _extract_first_error(log_tail: str) -> str:
-    """Return the first error-looking line from captured build output."""
-    for line in log_tail.splitlines():
-        if re.search(
-            r"error:|CMake Error|FAILED:|fatal error:|undefined reference|"
-            r"dpkg-source: error|cannot find|No such file|ImportError",
-            line,
-        ):
-            return line.strip()[:200]
-    return ""
 
 
 def initial_user_message(
@@ -175,7 +168,7 @@ def initial_user_message(
         else ""
     )
 
-    first_error = _extract_first_error(initial_failure.log_tail or "")
+    first_error = first_error_line(initial_failure.log_tail or "")
     first_error_section = (
         f"\nFirst error found in log: {first_error}\n"
         if first_error

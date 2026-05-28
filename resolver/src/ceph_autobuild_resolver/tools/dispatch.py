@@ -39,6 +39,8 @@ class DispatchOutcome:
     results: list[ToolResult]
     declared_resolved: bool = False
     resolution_summary: str | None = None
+    declared_unresolvable: bool = False
+    unresolvable_reason: str | None = None
 
 
 # Tools whose successful invocation counts as "the working tree changed".
@@ -86,6 +88,11 @@ class Dispatcher:
             # declare_resolved is handled inline so we can capture the summary
         }
 
+    @property
+    def files_changed(self) -> bool:
+        """True when file mutations have occurred since the last run_build."""
+        return self._execution.files_changed_since_last_build
+
     def _read_log_bound(self, **kwargs: Any) -> dict[str, Any]:
         # The log path lives inside the container and isn't something we want
         # the model to have to know — inject it.
@@ -98,10 +105,43 @@ class Dispatcher:
         results: list[ToolResult] = []
         declared = False
         summary: str | None = None
+        unresolvable = False
+        unresolvable_reason: str | None = None
 
         for call in calls:
             log.info("dispatch %s args=%s", call.name, call.args)
             display.tool_dispatch(call.name, call.args)
+
+            # Reject malformed args before any handler, including terminal calls.
+            # A malformed declare_resolved/declare_unresolvable should be a
+            # correctable error, not an irreversible loop termination.
+            if "__malformed_arguments__" in call.args:
+                results.append(
+                    ToolResult(
+                        call_id=call.id,
+                        name=call.name,
+                        payload={
+                            "error": "your tool arguments were not valid JSON; "
+                            "re-issue with valid JSON",
+                            "raw": call.args["__malformed_arguments__"],
+                        },
+                    )
+                )
+                continue
+
+            if call.name == "declare_unresolvable":
+                reason = str(call.args.get("reason", ""))
+                unresolvable = True
+                unresolvable_reason = reason
+                results.append(
+                    ToolResult(
+                        call_id=call.id,
+                        name=call.name,
+                        payload={"acknowledged": True},
+                    )
+                )
+                continue
+
             if call.name == "declare_resolved":
                 last = self._execution.last_build
                 if last is not None and not last.ok:
@@ -143,20 +183,6 @@ class Dispatcher:
                 )
                 continue
 
-            if "__malformed_arguments__" in call.args:
-                results.append(
-                    ToolResult(
-                        call_id=call.id,
-                        name=call.name,
-                        payload={
-                            "error": "your tool arguments were not valid JSON; "
-                            "re-issue with valid JSON",
-                            "raw": call.args["__malformed_arguments__"],
-                        },
-                    )
-                )
-                continue
-
             try:
                 payload = handler(**call.args)
             except guards.EditScopeViolation as exc:
@@ -184,4 +210,6 @@ class Dispatcher:
             results=results,
             declared_resolved=declared,
             resolution_summary=summary,
+            declared_unresolvable=unresolvable,
+            unresolvable_reason=unresolvable_reason,
         )

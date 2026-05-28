@@ -15,19 +15,19 @@ One turn through the loop:
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 
 from . import display
 from .budget import Budget
-from .providers.base import Message, ProviderAdapter
+from .build_runner import first_error_line
+from .providers.base import ROLE_MODEL, Message, ProviderAdapter
 from .tools.dispatch import Dispatcher
 from .transcript import Transcript
 
 log = logging.getLogger(__name__)
 
 
-def _maybe_record_compilation(budget: "Budget", payload: dict) -> None:  # noqa: F821
+def _maybe_record_compilation(budget: Budget, payload: dict) -> None:
     """Mark compilation reached if this run_build result cleared dpkg-source.
 
     Signals used (in priority order):
@@ -62,7 +62,7 @@ def _summarize_turns(turns: list[Message]) -> str:
     entries: list[str] = []
 
     for msg in turns:
-        if msg.role == "model":
+        if msg.role == ROLE_MODEL:
             for tc in msg.tool_calls:
                 if tc.name == "run_build":
                     entries.append("• run_build called")
@@ -93,6 +93,11 @@ def _summarize_turns(turns: list[Message]) -> str:
                             ):
                                 entries.append(f"    {line.strip()[:150]}")
                                 break
+                elif r.name == "check_patch":
+                    ok = r.payload.get("ok", False)
+                    patch = r.payload.get("patch", "?")
+                    status = "PASSED" if ok else "FAILED"
+                    entries.append(f"  → check_patch {patch}: {status}")
 
     if not entries:
         return "[Session history compressed — earlier turns had no file changes or builds]"
@@ -108,6 +113,11 @@ def _compress_history(history: list[Message]) -> None:
     Always preserves history[0] (system prompt) and history[1] (initial user
     context) plus the _KEEP_RECENT_TURNS most recent messages. Everything in
     between is collapsed into a single synthetic summary message.
+
+    INVARIANT: history[0] must be the system message and history[1] must be
+    the initial user context message (set by orchestrator before run_loop is
+    called). The ``cut = max(cut, 2)`` and ``del history[2:cut]`` below depend
+    on this layout.
     """
     if len(history) <= _COMPRESS_AFTER_TURNS:
         return
@@ -154,9 +164,6 @@ def run_loop(
     ``history`` is mutated in place — caller can inspect it afterwards (e.g.
     to re-enter the loop after a validation failure).
     """
-    # True whenever a write_file / edit_file / apply_patch / delete_file
-    # succeeded since the last run_build. Used to detect spinning.
-    files_changed_since_build = False
     # First error line from the most recent failed run_build, for nudge messages.
     last_build_error: str = ""
 
@@ -215,6 +222,17 @@ def run_loop(
         transcript.tool_results(outcome.results)
         history.append(Message(role="tool", tool_results=outcome.results))
 
+        if outcome.declared_unresolvable:
+            log.warning(
+                "model declared unresolvable: %s", outcome.unresolvable_reason
+            )
+            return LoopResult(
+                declared_resolved=False,
+                resolution_summary=outcome.unresolvable_reason,
+                history=history,
+                stop_reason="declared_unresolvable",
+            )
+
         if outcome.declared_resolved:
             return LoopResult(
                 declared_resolved=True,
@@ -223,33 +241,24 @@ def run_loop(
                 stop_reason="resolved",
             )
 
-        # If check_patch just passed, nudge the model to run_build immediately.
-        # Without this the model sometimes stalls after a successful dry-run.
-        for r in outcome.results:
-            if r.name == "check_patch" and r.payload.get("ok"):
-                history.append(
-                    Message(
-                        role="user",
-                        text=(
-                            "check_patch passed — the patch applies cleanly. "
-                            "Call run_build now to verify it actually compiles."
-                        ),
+        # If check_patch just passed and there are pending file changes (i.e.
+        # run_build would execute if called now), nudge the model to do it.
+        # dispatcher.files_changed is the authoritative "would run_build execute?"
+        # signal — it reflects execution.files_changed_since_last_build which is
+        # set by the dispatcher on every successful file-mutation tool call.
+        if dispatcher.files_changed:
+            for r in outcome.results:
+                if r.name == "check_patch" and r.payload.get("ok"):
+                    history.append(
+                        Message(
+                            role="user",
+                            text=(
+                                "check_patch passed — the patch applies cleanly. "
+                                "Call run_build now to verify it actually compiles."
+                            ),
+                        )
                     )
-                )
-                break
-
-        # Track file mutations and drive the no-progress streak.
-        _FILE_MUTATORS = {
-            "write_file",
-            "edit_file",
-            "apply_patch",
-            "delete_file",
-            "replace_in_upstream",
-            "drop_patch",
-        }
-        for r in outcome.results:
-            if r.name in _FILE_MUTATORS and r.payload.get("ok"):
-                files_changed_since_build = True
+                    break
 
         for r in outcome.results:
             if r.name == "run_build":
@@ -259,20 +268,15 @@ def run_loop(
                 # messages can be specific about what needs fixing.
                 if not r.payload.get("ok") and not r.payload.get("skipped"):
                     tail = r.payload.get("log_tail") or ""
-                    for line in tail.splitlines():
-                        if re.search(
-                            r"error:|CMake Error|FAILED:|fatal error:|"
-                            r"undefined reference|cannot find",
-                            line,
-                        ):
-                            last_build_error = line.strip()[:200]
-                            break
+                    line = first_error_line(tail)
+                    if line:
+                        last_build_error = line
 
-                # A refused build is the strongest possible no-progress
-                # signal: the model invoked run_build despite the hard
-                # guard already telling it nothing had changed. Treat it
-                # exactly like a failed build with no preceding mutation.
                 if r.payload.get("skipped"):
+                    # The hard guard refused the build: nothing changed since
+                    # the previous failed attempt. This is the authoritative
+                    # no-progress signal — the execution layer already enforced
+                    # it, so we don't need a separate local flag.
                     budget.record_unchanged_build()
                     error_hint = (
                         f"\nLast known error: {last_build_error}" if last_build_error else ""
@@ -290,33 +294,11 @@ def run_loop(
                         )
                     )
                     continue
+                # Build executed (not skipped): file changes were present (or
+                # this is the first build). Either way reset the streak.
+                budget.reset_unchanged_streak()
                 if r.payload.get("ok"):
-                    budget.reset_unchanged_streak()
-                    files_changed_since_build = False
                     last_build_error = ""
-                else:
-                    if files_changed_since_build:
-                        budget.record_failure()
-                        files_changed_since_build = False
-                    else:
-                        # No file changes since last build — genuine spin.
-                        budget.record_unchanged_build()
-                        error_hint = (
-                            f"\nError to fix: {last_build_error}" if last_build_error else ""
-                        )
-                        history.append(
-                            Message(
-                                role="user",
-                                text=(
-                                    "The build failed and no files changed since the "
-                                    "previous build. Stop diagnosing — make a fix now. "
-                                    "Change a file with edit_file, write_file, "
-                                    "replace_in_upstream, or drop_patch, then call "
-                                    "run_build."
-                                    f"{error_hint}"
-                                ),
-                            )
-                        )
 
     return LoopResult(
         declared_resolved=False,
