@@ -22,5 +22,12 @@ def build(cfg: Config) -> ProviderAdapter:
             reasoning=reasoning,
         )
     if cfg.provider == "gemini":
-        return GeminiAdapter(api_key=cfg.api_key, model=cfg.model_name)
+        # Thinking is always enabled. REASONING_MAX_TOKENS caps the per-call
+        # thinking token budget; if unset, the model decides its own budget.
+        # REASONING_EFFORT is not supported by Gemini (OpenRouter-only).
+        return GeminiAdapter(
+            api_key=cfg.api_key,
+            model=cfg.model_name,
+            thinking_budget=cfg.reasoning_max_tokens or None,
+        )
     raise ValueError(f"unknown provider: {cfg.provider!r}")

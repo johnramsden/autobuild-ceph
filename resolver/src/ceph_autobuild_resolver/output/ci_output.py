@@ -195,22 +195,25 @@ def _annotate_diff(diff: str, summary: str) -> str:
     return "".join(out)
 
 
-# Map stop_reason codes to human-readable recommendations.
+# Map stop_reason codes (from budget.reason_for_stop() and the orchestrator)
+# to human-readable recommendations.  Keys MUST match the strings returned by
+# Budget.reason_for_stop() exactly, plus the orchestrator-supplied "validation_failed"
+# and the model-supplied "declared_unresolvable".
 _RECOMMENDATIONS: dict[str, str] = {
     "validation_failed": textwrap.dedent("""\
         The fix compiled successfully but failed clean-rebuild validation —
         git apply could not re-apply the generated diff to a fresh container.
 
         Likely causes:
-          • The diff includes files outside debian/patches/ or debian/rules
-            (build artefacts, quilt .orig files).  Check _capture_diff scoping.
+          • The diff includes files outside debian/ (build artefacts, quilt
+            .orig files).  Only files under debian/ should be in the diff.
           • A patch hunk has wrong line-number context.  Run
             'patch -F 0 -p1 --dry-run < debian/patches/<name>.patch' on a
             clean checkout to identify which patch fails.
           • A patch deletes a file whose content in the baseline snapshot
             differs from what the diff expects (stale snapshot)."""),
 
-    "max_iterations_exceeded": textwrap.dedent("""\
+    "max_iterations": textwrap.dedent("""\
         The model used all available iterations without resolving the build.
 
         Likely causes:
@@ -223,24 +226,45 @@ _RECOMMENDATIONS: dict[str, str] = {
             Increase MAX_UNCHANGED_ITERATIONS or tighten the nudge messages
             in loop.py."""),
 
-    "max_wall_seconds_exceeded": textwrap.dedent("""\
+    "wall_time_exceeded": textwrap.dedent("""\
         The resolver hit the wall-clock time limit (MAX_WALL_SECONDS).
         The build itself may still be running or the model stalled.
 
         Try: raise MAX_WALL_SECONDS, or set MAX_SECONDS_TO_FIRST_BUILD to
         catch a model that never reaches run_build."""),
 
-    "max_unchanged_exceeded": textwrap.dedent("""\
+    "compilation_not_reached_in_time": textwrap.dedent("""\
+        The resolver stopped because no build reached the compilation phase
+        within MAX_SECONDS_TO_FIRST_BUILD seconds.
+
+        Likely causes:
+          • A quilt patch fails to apply (dpkg-source: error) and the model
+            is stuck debugging it without making progress.
+          • The build environment is slow and the time limit is too tight.
+
+        Try: raise MAX_SECONDS_TO_FIRST_BUILD, or check the patch series for
+        stale patches that block dpkg-source before compilation starts."""),
+
+    "no_progress": textwrap.dedent("""\
         The model made no file changes for several consecutive iterations.
         It is stuck in a diagnosis loop without acting.
 
         Try: lower MAX_UNCHANGED_ITERATIONS to force earlier nudging, or
-        improve the anti-spinning rules in prompts.py (RULES YOU MUST FOLLOW
-        section)."""),
+        improve the anti-spinning rules in prompts.py (Action rules section)."""),
 
     "token_budget_exceeded": textwrap.dedent("""\
         The per-run token budget was exhausted (RUN_TOKEN_BUDGET).
         Raise RUN_TOKEN_BUDGET or switch to a model with lower token usage."""),
+
+    "declared_unresolvable": textwrap.dedent("""\
+        The model determined the build failure is not solvable with the
+        available tools and information.  The model's explanation is above.
+
+        Likely next steps:
+          • Read the model's explanation in the transcript.
+          • If domain knowledge is missing, add it to prompts.py.
+          • If the upstream source has a genuine incompatibility, escalate
+            to the packaging team for a manual fix."""),
 }
 
 _DEFAULT_RECOMMENDATION = textwrap.dedent("""\
@@ -249,7 +273,7 @@ _DEFAULT_RECOMMENDATION = textwrap.dedent("""\
       • Run the resolver again with a higher iteration budget.
       • Add guidance for this error class to prompts.py.
       • If the error is a known packaging invariant, add it to the
-        DEBIAN PACKAGING INVARIANTS section of the system prompt.""")
+        "Debian packaging invariants" section of the system prompt.""")
 
 
 def _recommendation(stop_reason: str, error_tail: str) -> str:
@@ -269,7 +293,7 @@ def _error_hint(error_tail: str) -> str:
             "Disk full during build.  Free space on the LXD host "
             "(target: ≥ 40 GB free) and retry."
         )
-    if "could not find boost" in tail or "boost_" in tail and "not found" in tail:
+    if "could not find boost" in tail or ("boost_" in tail and "not found" in tail):
         return (
             "A Boost component is missing from BOOST_COMPONENTS or not "
             "installed.  Check if the library is header-only (no .cmake "

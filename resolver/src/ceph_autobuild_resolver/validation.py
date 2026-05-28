@@ -17,9 +17,6 @@ from .lxd import LXDManager
 
 log = logging.getLogger(__name__)
 
-VALIDATION_CONTAINER = "ceph-build-validate"
-
-
 @dataclass
 class ValidationResult:
     ok: bool
@@ -35,26 +32,36 @@ def validate(
     pristine_snapshot: str,
     diff: str,
 ) -> ValidationResult:
+    # Derive the validation container name from the pristine container so
+    # concurrent resolver runs on different containers don't collide.
+    validation_container = f"{pristine_container}-validate"
+
     # Always start from a clean validation container.
-    lxd.delete(VALIDATION_CONTAINER, force=True)
+    lxd.delete(validation_container, force=True)
     lxd.copy_from_snapshot(
-        pristine_container, pristine_snapshot, VALIDATION_CONTAINER
+        pristine_container, pristine_snapshot, validation_container
     )
 
-    apply_result = runner.apply_diff(VALIDATION_CONTAINER, diff)
-    if not apply_result.ok:
-        # Don't even bother building; the diff itself is malformed.
-        return ValidationResult(
-            ok=False,
-            build_outcome=BuildOutcome(
+    try:
+        apply_result = runner.apply_diff(validation_container, diff)
+        if not apply_result.ok:
+            # Don't even bother building; the diff itself is malformed.
+            return ValidationResult(
                 ok=False,
-                stage="apply_diff",
-                returncode=apply_result.returncode,
-                log_path="",
-                log_tail="",
-            ),
-            apply_stderr=apply_result.stderr,
-        )
+                build_outcome=BuildOutcome(
+                    ok=False,
+                    stage="apply_diff",
+                    returncode=apply_result.returncode,
+                    log_path="",
+                    log_tail="",
+                ),
+                apply_stderr=apply_result.stderr,
+            )
 
-    outcome = runner.build(VALIDATION_CONTAINER)
-    return ValidationResult(ok=outcome.ok, build_outcome=outcome)
+        outcome = runner.build(validation_container)
+        return ValidationResult(ok=outcome.ok, build_outcome=outcome)
+    finally:
+        # Always delete the temporary validation container so containers don't
+        # accumulate across runs. The next run's pre-delete is a safety net
+        # only, not the primary cleanup.
+        lxd.delete(validation_container, force=True)

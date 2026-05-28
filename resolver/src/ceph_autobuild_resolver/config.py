@@ -39,8 +39,9 @@ class Config:
 
     # Wall-clock time limits (seconds). 0 = disabled.
     # max_wall_seconds: hard cap on total loop duration.
-    # max_seconds_to_first_build: stop if run_build hasn't been called within
-    #   this many seconds of loop start — catches a model stuck in pure diagnosis.
+    # max_seconds_to_first_build: stop if the build hasn't cleared the patch/packaging
+    #   phase and reached actual compilation within this many seconds — catches a
+    #   model stuck in pure diagnosis or a patch that never applies.
     max_wall_seconds: int = 0
     max_seconds_to_first_build: int = 0
 

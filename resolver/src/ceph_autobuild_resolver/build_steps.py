@@ -197,55 +197,46 @@ def install_build_requirements_stage(cfg: Config) -> Stage:
     )
 
 
+CONTAINER_CCACHE_DIR = "/root/ccache"
+
+# Shell script that resets the upstream source tree to a clean HEAD baseline.
+# Used both at the start of the build stage and during the preflight patch
+# walk so both see the same state that dpkg-source would.
+#
+# Steps in order:
+#   1. quilt pop -a  — revert whatever quilt successfully applied (.pc/ may
+#                       be present from a previous failed push).
+#   2. rm -rf .pc    — drop quilt's bookkeeping directory entirely.
+#   3. git checkout HEAD -- with pathspec-exclude — restore every tracked
+#                       file outside debian/ to its committed (= tarball) state.
+#   4. git clean -fd — remove untracked files outside debian/ (.rej, .orig,
+#                       stale build artefacts from a partial compilation).
+#
+# Every command is || true so the reset is best-effort: if quilt isn't
+# installed, or there's nothing to clean, we still proceed.
+TREE_RESET_SCRIPT = (
+    "quilt pop -a 2>/dev/null || true; "
+    "rm -rf .pc; "
+    "git checkout HEAD -- . ':(exclude)debian' 2>/dev/null || true; "
+    "git clean -fd -e debian/ 2>/dev/null || true; "
+    "true"
+)
+
+
 def build_stage(cfg: Config) -> Stage:
     return Stage(
         name="build",
         steps=[
             Step(["mkdir", "-p", cfg.container_log_dir]),
             # Reset to a clean upstream tree before every debuild attempt.
-            #
-            # dpkg-source rejects the build with "unexpected upstream changes"
-            # if anything outside debian/ differs from the original tarball
-            # without being covered by a series patch. A failed quilt push
-            # from a previous attempt commonly leaves exactly that state:
-            # files partially modified, .pc/ populated, .rej / .orig files
-            # scattered around. We clean it up aggressively here:
-            #
-            #   * quilt pop -a   reverts whatever quilt successfully applied
-            #   * rm -rf .pc     drops quilt's bookkeeping
-            #   * git checkout HEAD -- with pathspec exclude restores every
-            #     tracked file outside debian/ to its committed (= tarball)
-            #     state, regardless of whether `git ls-files -m` saw it
-            #   * git clean -fd  removes untracked files (.rej, .orig,
-            #     stale build artefacts) outside debian/
-            #
-            # `|| true` on each step keeps the reset best-effort: if quilt
-            # isn't installed, or there's nothing to clean, we still proceed.
+            # See TREE_RESET_SCRIPT above for the full rationale.
+            Step(["bash", "-c", TREE_RESET_SCRIPT], workdir=cfg.container_workdir),
             Step(
-                [
-                    "bash",
-                    "-c",
-                    "quilt pop -a 2>/dev/null || true; "
-                    "rm -rf .pc; "
-                    "git checkout HEAD -- . ':(exclude)debian' 2>/dev/null || true; "
-                    "git clean -fd -e debian/ 2>/dev/null || true; "
-                    "true",
-                ],
-                workdir=cfg.container_workdir,
-            ),
-            Step(
-                [
-                    "bash",
-                    "-c",
-                    _debuild_cmd(cfg),
-                ],
+                ["bash", "-c", _debuild_cmd(cfg)],
                 workdir=cfg.container_workdir,
             ),
         ],
     )
-
-
-_CONTAINER_CCACHE_DIR = "/root/ccache"
 
 
 def _debuild_cmd(cfg: Config) -> str:
@@ -254,7 +245,7 @@ def _debuild_cmd(cfg: Config) -> str:
         return base
     return (
         f"PATH=/usr/lib/ccache:$PATH "
-        f"CCACHE_DIR={_CONTAINER_CCACHE_DIR} "
+        f"CCACHE_DIR={CONTAINER_CCACHE_DIR} "
         f"CCACHE_BASEDIR={cfg.container_workdir} "
         f"CCACHE_MAXSIZE=20G "
         f"{base}"

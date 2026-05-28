@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from . import config, orchestrator, prep
@@ -177,6 +178,7 @@ def _prep_only_config():
         debian_ref=os.environ.get("DEBIAN_REF", "origin/ubuntu/latest"),
         launchpad_owner=os.environ.get("LAUNCHPAD_OWNER", "lmlogiudice"),
         ceph_version=os.environ.get("CEPH_VERSION", "20.2.0"),
+        ccache_host_dir=os.environ.get("CCACHE_HOST_DIR") or None,
     )
 
 

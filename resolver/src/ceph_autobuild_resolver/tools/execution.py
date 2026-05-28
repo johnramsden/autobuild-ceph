@@ -61,18 +61,17 @@ class ExecutionHandlers:
     def check_patch(self, path: str) -> dict[str, Any]:
         """Dry-run a patch using the same flags dpkg-source uses.
 
-        Tests whether the patch applies cleanly to the source tree *in its
-        current state* (all previously-applied patches still in place).
-        This matches how dpkg-source applies patches in series order: each
-        patch is applied on top of the previous ones, so our new patch
-        (appended last in series) must apply to the fully-patched tree.
+        Runs ``patch -F 0 -p1 --dry-run`` against the working tree *in its
+        current state* — whatever state quilt has left it in. The caller is
+        responsible for ensuring the preceding patches in series are already
+        applied if they want a faithful simulation of series-order application.
         """
         guards.assert_in_scope(path)
         rel = guards.normalize(path)
-        full = f"{self.runner._cfg.container_workdir}/{rel}"  # type: ignore[attr-defined]
-        workdir = self.runner._cfg.container_workdir  # type: ignore[attr-defined]
+        full = f"{self.runner.cfg.container_workdir}/{rel}"
+        workdir = self.runner.cfg.container_workdir
         cmd = f"patch -F 0 -p1 --dry-run < {shlex.quote(full)}"
-        result = self.runner._lxd.exec(  # type: ignore[attr-defined]
+        result = self.runner.lxd.exec(
             self.container,
             ["bash", "-c", cmd],
             cwd=workdir,
@@ -85,15 +84,11 @@ class ExecutionHandlers:
 
     def clean(self) -> dict[str, Any]:
         # ``debuild`` leaves *.buildinfo / *.changes / *.deb at the parent of
-        # the source tree. The build.sh ``install_build_requirements`` stage
-        # already does ``rm *.buildinfo *.changes *.deb`` so we just defer to
-        # that here.
-        result = self.runner._lxd.exec_shell(  # type: ignore[attr-defined]
+        # the source tree. container_workdir is always /root/ceph, so ``/..``
+        # resolves to /root where debuild drops its output.
+        result = self.runner.lxd.exec_shell(
             self.container,
-            (
-                f"cd {self.runner._cfg.container_workdir}/.. && "  # type: ignore[attr-defined]
-                "rm -f *.buildinfo *.changes *.deb"
-            ),
+            f"cd {self.runner.cfg.container_workdir}/.. && rm -f *.buildinfo *.changes *.deb",
             check=False,
         )
         return {"ok": result.ok}

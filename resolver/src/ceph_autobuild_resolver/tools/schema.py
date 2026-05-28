@@ -35,6 +35,7 @@ def all_tools() -> list[ToolSchema]:
         _run_build(),
         _clean(),
         _declare_resolved(),
+        _declare_unresolvable(),
     ]
 
 
@@ -75,7 +76,14 @@ def _replace_in_upstream() -> ToolSchema:
                     "description": (
                         "Exact text to replace, copied verbatim from the file. "
                         "Must match exactly once — include surrounding lines "
-                        "for uniqueness if needed."
+                        "for uniqueness if needed. "
+                        "IMPORTANT: keep old_content short (a few lines). "
+                        "To add a namespace wrapper, make TWO calls: one "
+                        "replacing just the anchor line at the start "
+                        "(e.g. '#define FOO 1\\n') with that line plus the "
+                        "opening brace, and a second replacing the closing "
+                        "'#endif' with '} // namespace ...\\n\\n#endif'. "
+                        "Never try to reproduce the entire file body verbatim."
                     ),
                 },
                 "new_content": {
@@ -187,8 +195,8 @@ def _grep_log() -> ToolSchema:
         name="grep_log",
         description=(
             "Search the captured build log for a pattern. Returns matching "
-            "lines with surrounding context and byte offsets you can pass to "
-            "read_log for a wider window. PREFER this over read_log when "
+            "lines with surrounding context as raw text (format: "
+            "'file:byteoffset:linenum:text'). PREFER this over read_log when "
             "looking for the root cause of a build failure — the log_tail "
             "in run_build's response only shows the first error excerpt, so "
             "for anything else (later errors, warnings, specific symbols) "
@@ -350,10 +358,10 @@ def _check_patch() -> ToolSchema:
         name="check_patch",
         description=(
             "Dry-run a patch file with 'patch -F 0 -p1 --dry-run' — the same "
-            "flags dpkg-source uses. Call this immediately after write_file on "
-            "any debian/patches/*.patch file to verify hunk headers and context "
-            "lines are correct. Returns ok=true only when all hunks apply "
-            "cleanly. Fix any reported mismatches before calling run_build."
+            "flags dpkg-source uses. Call this after replace_in_upstream creates "
+            "or updates a debian/patches/*.patch file to verify hunk headers and "
+            "context lines are correct before calling run_build. Returns ok=true "
+            "only when all hunks apply cleanly."
         ),
         parameters={
             "type": "object",
@@ -392,6 +400,33 @@ def _clean() -> ToolSchema:
             "preserves cache by design."
         ),
         parameters={"type": "object", "properties": {}},
+    )
+
+
+def _declare_unresolvable() -> ToolSchema:
+    return ToolSchema(
+        name="declare_unresolvable",
+        description=(
+            "Terminal call. Use ONLY when you have exhausted all reasonable "
+            "approaches and are confident the build failure cannot be fixed "
+            "with the tools and information available. Provide a clear account "
+            "of what you tried, why each approach failed, and what additional "
+            "information or changes would be needed. The harness will record "
+            "your explanation, file a bug, and exit."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Explanation of what was tried, why it failed, and "
+                        "what would be needed to resolve it."
+                    ),
+                },
+            },
+            "required": ["reason"],
+        },
     )
 
 

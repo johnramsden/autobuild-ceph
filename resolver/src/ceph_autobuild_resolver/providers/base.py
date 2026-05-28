@@ -38,6 +38,7 @@ from typing import Any, Literal, Protocol
 #
 # We use the role name "model" internally (Gemini's term). The OpenRouter
 # adapter rewrites it to "assistant" on the wire.
+ROLE_MODEL = "model"
 
 Role = Literal["system", "user", "model", "tool"]
 

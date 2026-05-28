@@ -9,6 +9,7 @@ without ANSI colour — which is fine.
 from __future__ import annotations
 
 import difflib
+import re
 
 from rich.console import Console
 from rich.panel import Panel
@@ -248,7 +249,6 @@ def _fmt_elapsed(seconds: float) -> str:
 
 def _parse_patch_changes(diff: str) -> list[tuple[str, str]]:
     """Extract (status, patch_filename) for debian/patches/*.patch entries."""
-    import re
     changes: list[tuple[str, str]] = []
     current: str | None = None
     is_new = is_del = False

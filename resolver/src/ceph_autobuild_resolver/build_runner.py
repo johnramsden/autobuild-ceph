@@ -29,14 +29,39 @@ _ERROR_CONTEXT_BEFORE = 50
 _ERROR_CONTEXT_AFTER = 50
 _ERROR_TRAILING_TAIL = 100
 # Word-boundary match on common failure markers, case-insensitive. Broad on
-# purpose — false positives just degrade to "model sees a useful chunk anyway",
-# which is no worse than the flat tail. False negatives fall back to flat tail.
-_ERROR_RE = re.compile(r"\b(error|failed|fatal)\b", re.IGNORECASE)
+# purpose — false positives degrade to "model sees a useful chunk anyway" (no
+# worse than the flat tail). Also covers C++ / CMake / dpkg-specific patterns
+# that don't match the word-boundary form (e.g. "undefined reference").
+_ERROR_RE = re.compile(
+    r"\b(error|failed|fatal)\b"
+    r"|undefined reference"
+    r"|cannot find"
+    r"|CMake Error"
+    r"|No such file"
+    r"|ImportError",
+    re.IGNORECASE,
+)
 # debuild runs with set -x, echoing all environment variables at the start.
 # Some of those variable VALUES contain the word "error" (e.g.
 # DH_OVERIDDEN_COMMAND=@echo 'error: ...'). Skip such assignment lines so
 # the first-error scan finds real build failures, not env-dump noise.
 _ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
+
+
+def first_error_line(log_tail: str) -> str:
+    """Return the first recognisable error/failed/fatal line from a build log.
+
+    Skips env-variable assignment lines from debuild's ``set -x`` preamble
+    (e.g. ``DH_OVERIDDEN_COMMAND=@echo 'error: ...'``) so we find real build
+    failures rather than env-dump noise.  Falls back to the last non-empty
+    line if no marker is found.
+    """
+    for line in log_tail.splitlines():
+        if _ENV_VAR_RE.match(line):
+            continue
+        if _ERROR_RE.search(line):
+            return line.strip()[:200]
+    return log_tail.strip().splitlines()[-1][:200] if log_tail.strip() else ""
 
 
 def _build_log_excerpt(full_output: str) -> str:
@@ -97,6 +122,14 @@ class BuildRunner:
         self._lxd = lxd
         self._cfg = cfg
 
+    @property
+    def cfg(self) -> Config:
+        return self._cfg
+
+    @property
+    def lxd(self) -> LXDManager:
+        return self._lxd
+
     # ------------------------------------------------------------------
     # Build stages
     # ------------------------------------------------------------------
@@ -135,13 +168,27 @@ class BuildRunner:
     # Resolver-specific helpers
     # ------------------------------------------------------------------
 
-    def apply_diff(self, container: str, diff_text: str) -> ExecResult:
-        """Apply a unified diff to the working tree inside the container.
+    def apply_patch_to_tree(self, container: str, diff_text: str) -> ExecResult:
+        """Apply a unified diff to the current working tree without resetting first.
 
-        The diff is generated relative to git HEAD.  The container may start
-        from a snapshot that already has working-tree modifications (e.g. a
-        "patched" snapshot from a prior session).  Reset to HEAD first so the
-        diff applies cleanly against the expected baseline.
+        Unlike apply_diff, this preserves all uncommitted working-tree changes
+        (patch files, rule edits, etc.) made earlier in the same session. Used
+        by the model's apply_patch tool so mid-session state is not wiped.
+        """
+        self._lxd.put_text(container, "/tmp/resolver.diff", diff_text)
+        return self._lxd.exec(
+            container,
+            ["git", "apply", "--whitespace=nowarn", "/tmp/resolver.diff"],
+            cwd=self._cfg.container_workdir,
+        )
+
+    def apply_diff(self, container: str, diff_text: str) -> ExecResult:
+        """Apply a unified diff to a clean HEAD baseline inside the container.
+
+        Used by validation to apply the model's final diff to a pristine
+        container copy — the tree MUST be reset first so the diff applies
+        against a known baseline. For mid-session applies (model's apply_patch
+        tool), use apply_patch_to_tree instead to preserve prior changes.
         """
         self._lxd.put_text(container, "/tmp/resolver.diff", diff_text)
         # Reset working tree AND index to a clean HEAD baseline.

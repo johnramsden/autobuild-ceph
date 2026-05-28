@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 from openai import OpenAI
 
+from .base import ROLE_MODEL
 from .base import (
     Message,
     ProviderAdapter,
@@ -146,7 +147,7 @@ def _to_wire_messages(
             else:
                 wire["content"] = msg.text
 
-        if msg.role == "model" and msg.reasoning_details:
+        if msg.role == ROLE_MODEL and msg.reasoning_details:
             wire["reasoning_details"] = msg.reasoning_details
 
         if msg.tool_calls:
@@ -169,7 +170,7 @@ def _to_wire_messages(
 
 
 def _role_to_wire(role: str) -> str:
-    return "assistant" if role == "model" else role
+    return "assistant" if role == ROLE_MODEL else role
 
 
 def _from_sdk_response(response: Any) -> tuple[Message, Usage]:
@@ -204,7 +205,7 @@ def _from_sdk_response(response: Any) -> tuple[Message, Usage]:
     )
 
     return Message(
-        role="model",
+        role=ROLE_MODEL,
         text=msg.content or None,
         reasoning=reasoning_text,
         reasoning_details=reasoning_details,
@@ -240,7 +241,7 @@ def _from_wire_response(data: dict[str, Any]) -> tuple[Message, Usage]:
 
     usage_in = data.get("usage", {}) or {}
     return Message(
-        role="model",
+        role=ROLE_MODEL,
         text=msg.get("content") or None,
         reasoning=reasoning_text,
         reasoning_details=reasoning_details,

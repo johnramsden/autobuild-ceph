@@ -14,6 +14,7 @@ reviewer attention.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -163,7 +164,7 @@ def _control_version_constraints_changed(old: str, new: str) -> bool:
     We extract lines that look like dependency constraints — anything
     containing ``(>=``, ``(<<``, ``(=``, ``(>>``, ``(<=`` — and compare sets.
     """
-    markers = ("(>=", "(<<", "(=", "(>>", "(<=", "(<")
+    markers = ("(>=", "(<<", "(=", "(>>")
 
     def constraint_lines(text: str) -> set[str]:
         return {
@@ -181,7 +182,6 @@ def _system_flag_disabled_in_patch(patch_content: str) -> bool:
     Scans only added lines (starting with '+' but not '+++') so we don't
     trigger on context lines or removed lines.
     """
-    import re
     # Matches cmake set() or option() calls that turn a WITH_SYSTEM_* off.
     _off_pattern = re.compile(
         r"WITH_SYSTEM_\w+\s+(OFF|False|0)\b", re.IGNORECASE

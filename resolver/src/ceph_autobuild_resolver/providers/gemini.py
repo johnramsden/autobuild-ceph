@@ -13,10 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from typing import Any
 from google import genai
 from google.genai import types
 
-from .base import Message, ProviderAdapter, ToolCall, ToolSchema, Usage
+from .base import ROLE_MODEL, Message, ProviderAdapter, ToolCall, ToolSchema, Usage
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +31,13 @@ _SCHEMA_UNSUPPORTED = frozenset({
 
 
 class GeminiAdapter(ProviderAdapter):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, thinking_budget: int | None = None) -> None:
         self._model = model
         self._client = genai.Client(api_key=api_key)
         self._fn_declarations: list[types.FunctionDeclaration] = []
+        # None means "let the model decide" (default thinking enabled).
+        # An explicit budget caps the thinking token spend per call.
+        self._thinking_budget = thinking_budget
 
     # ------------------------------------------------------------------
     # Tool declaration
@@ -70,7 +74,10 @@ class GeminiAdapter(ProviderAdapter):
                 [types.Tool(function_declarations=self._fn_declarations)]
                 if self._fn_declarations else None
             ),
-            thinking_config=types.ThinkingConfig(include_thoughts=True),
+            thinking_config=types.ThinkingConfig(
+                include_thoughts=True,
+                **({"thinking_budget": self._thinking_budget} if self._thinking_budget else {}),
+            ),
         )
 
         log.debug("gemini request: %d content turns", len(contents))
@@ -112,7 +119,7 @@ def _to_content(msg: Message) -> types.Content:
                 thought_signature=tc.thought_signature,
             ))
         # Gemini rejects empty-text parts; use a space if truly empty.
-        return types.Content(role="model", parts=parts or [types.Part.from_text(text=" ")])
+        return types.Content(role=ROLE_MODEL, parts=parts or [types.Part.from_text(text=" ")])
 
     # user
     return types.Content(role="user", parts=[types.Part.from_text(text=msg.text or "")])
@@ -129,7 +136,7 @@ def _from_response(response: Any) -> tuple[Message, Usage]:
         # silently receiving an empty message.
         log.error("gemini finish_reason=%s — returning block signal to caller", finish)
         return Message(
-            role="model",
+            role=ROLE_MODEL,
             text=f"[BLOCKED: finish_reason={finish}]",
         ), Usage(input_tokens=0, output_tokens=0)
 
@@ -167,7 +174,7 @@ def _from_response(response: Any) -> tuple[Message, Usage]:
         input_tokens = output_tokens = 0
 
     return Message(
-        role="model",
+        role=ROLE_MODEL,
         text="\n".join(text_parts) or None,
         reasoning="\n".join(thought_parts) or None,
         tool_calls=tool_calls,

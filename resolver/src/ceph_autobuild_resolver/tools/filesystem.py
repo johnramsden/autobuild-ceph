@@ -64,6 +64,21 @@ class FilesystemHandlers:
             except (ValueError, IndexError):
                 total_lines = 0
 
+            if total_lines > 0 and start_line > total_lines:
+                files.append({
+                    "path": rel,
+                    "content": "",
+                    "start_line": start_line,
+                    "end_line": total_lines,
+                    "total_lines": total_lines,
+                    "truncated": False,
+                    "note": (
+                        f"start_line ({start_line}) is beyond end of file "
+                        f"({total_lines} lines) — use a smaller start_line"
+                    ),
+                })
+                continue
+
             effective_end = end_line or (start_line + DEFAULT_READ_FILE_LINES - 1)
             # ``sed -n 'a,bp'`` is portable and 1-indexed inclusive on both ends.
             slice_res = self.lxd.exec(
@@ -225,11 +240,16 @@ class FilesystemHandlers:
 
     def apply_patch(self, diff: str) -> dict[str, Any]:
         # Scope-check every path mentioned in the diff before applying.
+        # The patch-file block (assert_not_patch_file) must also be enforced
+        # here: apply_patch can otherwise bypass the hard block that write_file
+        # and edit_file enforce, allowing the model to directly write malformed
+        # @@ headers into debian/patches/*.patch files.
         for path in _diff_target_paths(diff):
             guards.assert_in_scope(path)
-        # We delegate the actual apply to the build runner, which already
-        # knows how to ship a diff into the container.
-        result = self.runner.apply_diff(self.container, diff)
+            guards.assert_not_patch_file(path)
+        # apply_patch_to_tree does NOT reset the working tree, so all prior
+        # model edits (patches written, rules changed) are preserved.
+        result = self.runner.apply_patch_to_tree(self.container, diff)
         return {
             "ok": result.ok,
             "stderr": result.stderr if not result.ok else "",
@@ -285,11 +305,28 @@ class FilesystemHandlers:
 
         occ = current.count(old_content)
         if occ == 0:
+            # Help the model understand where the mismatch starts so it can
+            # correct old_content without a full re-read.
+            hint = ""
+            if old_content:
+                # Find the longest prefix of old_content that IS in the file.
+                for length in range(min(len(old_content), 120), 0, -1):
+                    if old_content[:length] in current:
+                        snippet = repr(old_content[:length])
+                        hint = (
+                            f" First {length} chars matched but diverged after that "
+                            f"(matched prefix: {snippet})."
+                        )
+                        break
+                if not hint:
+                    snippet = repr(old_content[:60])
+                    hint = f" Even the first characters were not found (started with: {snippet})."
             return {
                 "ok": False,
                 "error": (
-                    f"old_content not found in {rel_file}. Read the file first "
-                    "and copy the exact text including whitespace."
+                    f"old_content not found in {rel_file}.{hint} "
+                    "Tip: use a short anchor (10-20 lines) rather than reproducing "
+                    "the entire section — exact whitespace must match the file."
                 ),
             }
         if occ > 1:
@@ -324,8 +361,22 @@ class FilesystemHandlers:
         old_patch = self._read_full_if_exists(full_patch)
 
         if old_patch:
-            # Patch already exists — append just the diff block; the DEP-3
-            # headers from the first call are already present.
+            # Guard against appending a second hunk for the same file: each
+            # hunk is computed against the unmodified on-disk file, so two
+            # independent hunks for the same file would have overlapping/
+            # contradictory context and dpkg-source would reject the patch.
+            already_patched = f"a/{rel_file}" in old_patch
+            if already_patched:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"{rel_file} already has a hunk in {patch_name}. "
+                        "To make multiple changes to the same file, combine "
+                        "them into one call: widen old_content to cover all "
+                        "the lines you want to replace."
+                    ),
+                }
+            # Append diff block; DEP-3 headers from the first call stay.
             patch_content = old_patch.rstrip("\n") + "\n" + diff_text
         else:
             headers = (

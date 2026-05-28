@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass
 
 from .build_runner import BuildRunner
+from .build_steps import CONTAINER_CCACHE_DIR
 from .config import Config
 from .lxd import LXDError, LXDManager
 
@@ -48,15 +49,15 @@ def run(
     lxd = lxd or LXDManager()
     runner = BuildRunner(lxd, cfg)
 
-    if not skip_existing or not _container_exists(lxd, container):
+    if not skip_existing or not lxd.exists(container):
         log.info("launching %s from %s", container, image)
         lxd.launch(image, container)
     else:
         log.info("reusing existing container %s", container)
 
     if cfg.ccache_host_dir and _prepare_ccache_dir(cfg.ccache_host_dir):
-        log.info("attaching ccache host dir %s -> /root/ccache", cfg.ccache_host_dir)
-        lxd.attach_disk_device(container, "ccache", cfg.ccache_host_dir, "/root/ccache")
+        log.info("attaching ccache host dir %s -> %s", cfg.ccache_host_dir, CONTAINER_CCACHE_DIR)
+        lxd.attach_disk_device(container, "ccache", cfg.ccache_host_dir, CONTAINER_CCACHE_DIR)
 
     log.info("install_dependencies")
     res = runner.install_dependencies(container)
@@ -74,9 +75,9 @@ def run(
         raise LXDError(f"install_build_requirements failed:\n{res.stderr}")
 
     log.info("snapshotting %s -> %s", container, snapshot)
-    # Best-effort delete of an old snapshot of the same name; pylxd raises if
-    # we try to create one that already exists.
-    _delete_snapshot_if_exists(lxd, container, snapshot)
+    # pylxd raises if we try to create a snapshot that already exists;
+    # delete the old one first so re-running prep is idempotent.
+    lxd.delete_snapshot(container, snapshot)
     lxd.snapshot(container, snapshot)
 
     return PrepOutcome(container=container, snapshot=snapshot, image=image)
@@ -121,24 +122,3 @@ def _prepare_ccache_dir(host_path: str) -> bool:
     return True
 
 
-def _container_exists(lxd: LXDManager, name: str) -> bool:
-    try:
-        lxd._instance(name)  # noqa: SLF001 — internal helper, fine for our use
-        return True
-    except LXDError:
-        return False
-
-
-def _delete_snapshot_if_exists(lxd: LXDManager, container: str, snapshot: str) -> None:
-    try:
-        inst = lxd._instance(container)  # noqa: SLF001
-    except LXDError:
-        return
-    try:
-        existing = inst.snapshots.get(snapshot)
-    except Exception:  # noqa: BLE001 — pylxd raises NotFound; we don't import it
-        return
-    try:
-        existing.delete(wait=True)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not delete existing snapshot %s: %s", snapshot, exc)

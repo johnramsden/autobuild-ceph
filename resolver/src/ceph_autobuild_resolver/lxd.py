@@ -181,6 +181,29 @@ class LXDManager:
                 f"attach_disk_device {device_name!r} on {container!r} failed: {exc}"
             ) from exc
 
+    def exists(self, name: str) -> bool:
+        """Return True if a container with this name exists, False otherwise."""
+        try:
+            self._instance(name)
+            return True
+        except LXDError:
+            return False
+
+    def delete_snapshot(self, container: str, snapshot: str) -> None:
+        """Delete ``snapshot`` from ``container`` if it exists; no-op otherwise."""
+        try:
+            inst = self._instance(container)
+        except LXDError:
+            return
+        try:
+            existing = inst.snapshots.get(snapshot)
+        except Exception:  # noqa: BLE001 — pylxd raises NotFound; we don't import it
+            return
+        try:
+            existing.delete(wait=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not delete snapshot %s/%s: %s", container, snapshot, exc)
+
     def delete(self, name: str, force: bool = True) -> None:
         try:
             inst = self._get_client().instances.get(name)
